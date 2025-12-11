@@ -1,0 +1,565 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <LiquidCrystal_PCF8574.h>
+// 移除了 #include <vector>
+#include <math.h>  // [修改] 替換 cmath，引入 C 語言數學庫，用於 fabs()
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------- LCD ----------
+LiquidCrystal_PCF8574 lcd(0x27);
+
+// ---------- MPU6050 ----------
+#define MPU_6050 0x68
+#define PWR_MGMT_1 0x6B
+#define ACCEL_XOUT_H 0x3B
+#define GYRO_XOUT_H  0x43
+
+// ---------- PIN ----------
+const int BUZZER_PIN = 8;
+const int RELAY_PIN  = 11;
+const int REMOTE_PIN = 3;
+const int HALL_SENSOR_PIN = 4;
+
+// ---------- ULTRASONIC ----------
+const int US_TRIG_PIN = 7; 
+const int US_ECHO_PIN = 6; 
+
+
+// ---------- RGB LED (數位 ON/OFF - 接腳位 D9, D10, D12) ----------
+const int RGB_R_PIN = 9;
+const int RGB_G_PIN = 10;
+const int RGB_B_PIN = 12;
+
+// ---------- 模組顏色 (數位 ON/OFF - R, G, B) ----------
+// 1 = HIGH (ON), 0 = LOW (OFF)
+const int COLOR_MPU[]       = {0, 0, 1}; // 藍色: MPU
+const int COLOR_RELAY[]     = {1, 0, 0}; // 紅色: 繼電器
+const int COLOR_HALL[]      = {1, 1, 0}; // 黃色: 霍爾
+const int COLOR_REMOTE[]    = {1, 0, 1}; // 洋紅色: 紅外線
+const int COLOR_BUZZER[]    = {0, 1, 1}; // 青色: 蜂鳴器
+const int COLOR_US[]        = {1, 1, 1}; // 白色: 超音波警報
+const int COLOR_PASS[]      = {0, 1, 0}; // 綠色: 正常
+const int COLOR_OFF[]       = {0, 0, 0}; // 熄滅
+
+// ---------- IMU ----------
+const float dt = 0.01f;         // 資料更新週期（秒）。代表每 10ms 更新一次 IMU 數據。
+const float alpha = 0.98f;      // 互補濾波係數。
+float compAngleX = 0.0f;        // 互補濾波後的最終角度（X 軸）
+float gyroBiasX = 0.0f;         // 陀螺儀在 X 軸的偏移值（校正時量到的誤差）
+float accelBiasX = 0.0f;        // 加速度計在 X 軸的偏移值（校正時量到的誤差）
+
+// ---------- 狀態 ----------
+bool wheelDown = false;         // 輔助輪目前是否為下降狀態（true=DOWN）
+unsigned long wheelAnimStartTime = 0;
+bool showWheelAnim = false;     // 是否播放輔助輪動畫
+byte ctrlSrc = 0;               // 控制來源（0=初始化、1=霍爾感測器、2=紅外線遙控）
+
+int lastHallState = HIGH;       // 上一次霍爾感測器的讀值
+int lastRemoteRead = LOW;       // 上一次紅外線讀值
+unsigned long lastPrintTime = 0; // 最後一次序列印出時間
+unsigned long lastDisplayTime = 0; // 最後一次更新顯示的時間
+
+// ---------- 超音波狀態 ----------
+long distance = 0;             // 超音波測量距離 (cm)
+unsigned long lastUltrasonicRead = 0; // 最後一次超音波讀取時間
+bool distanceAlert = false;    // 距離是否在警報範圍內
+
+// ---------- RGB 輪播控制 ----------
+const unsigned long CAROUSEL_INTERVAL = 400; // 顏色切換間隔 400ms
+
+// =====================================================================
+// RGB LED 輸出函數
+// =====================================================================
+void setRGBColor(const int color[]) {
+  // 假設使用 Common Cathode (共陰極) RGB LED 模組
+  digitalWrite(RGB_R_PIN, color[0] == 1 ? HIGH : LOW);
+  digitalWrite(RGB_G_PIN, color[1] == 1 ? HIGH : LOW);
+  digitalWrite(RGB_B_PIN, color[2] == 1 ? HIGH : LOW);
+}
+
+// =====================================================================
+// MPU 基本讀取
+// =====================================================================
+void mpuReadBytes(uint8_t reg, uint8_t count, uint8_t* dest) {
+  Wire.beginTransmission(MPU_6050); 
+  Wire.write(reg);                  
+  Wire.endTransmission(false);      
+  Wire.requestFrom((uint8_t)MPU_6050, count); 
+  for (uint8_t i = 0; i < count; i++) dest[i] = Wire.read(); 
+}
+
+int16_t read16(uint8_t reg) {
+  uint8_t buf[2];
+  mpuReadBytes(reg, 2, buf);         
+  return (int16_t)((buf[0] << 8) | buf[1]); 
+}
+
+void setupMPU() {
+  Wire.beginTransmission(MPU_6050);
+  Wire.write(PWR_MGMT_1); 
+  Wire.write(0x00);       
+  Wire.endTransmission();
+  delay(50);              
+}
+
+void calibrateIMU() {
+  float sumAx = 0, sumGx = 0;
+  for (byte i = 0; i < 50; i++) {  
+    sumAx += read16(ACCEL_XOUT_H) / 16384.0f;  
+    sumGx += read16(GYRO_XOUT_H) / 131.0f;     
+    delay(5);
+  }
+  accelBiasX = sumAx / 50;  
+  gyroBiasX  = sumGx / 50;  
+}
+
+void readIMU(float &ax, float &gx) {
+  ax = read16(ACCEL_XOUT_H) / 16384.0f;        
+  float az = read16(ACCEL_XOUT_H + 4) / 16384.0f;    
+  gx = read16(GYRO_XOUT_H) / 131.0f;          
+
+  gx -= gyroBiasX; 
+  ax -= accelBiasX;
+
+  float accelAngle = atan2(ax, az) * 57.2958f; 
+
+  compAngleX = alpha * (compAngleX + gx * dt)
+             + (1 - alpha) * accelAngle;
+}
+
+// =====================================================================
+// 超音波感測器函數
+// =====================================================================
+long readUltrasonic() {
+  digitalWrite(US_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  
+  digitalWrite(US_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(US_TRIG_PIN, LOW);
+  
+  long duration = pulseIn(US_ECHO_PIN, HIGH);
+  
+  long cm = duration / 29 / 2;
+  
+  if (cm > 400) return 400; 
+  
+  return cm;
+}
+
+
+// =====================================================================
+// 專業啟動畫面
+// =====================================================================
+void showStartup() {
+  // 專業開機動畫
+  display.clearDisplay();
+  
+  // 閃爍 LOGO
+  for (int i = 0; i < 2; i++) {
+    display.fillRect(0, 0, 128, 32, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setTextSize(3);
+    display.setCursor(14, 6);
+    display.print("BIKE");
+    setRGBColor(COLOR_PASS); 
+    display.display();
+    display.setTextColor(SSD1306_WHITE);
+    delay(300);
+    setRGBColor(COLOR_OFF);  
+    display.clearDisplay();
+    display.display();
+    delay(150);
+  }
+  
+  // 載入動畫
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(28, 8);
+  display.print("LOADING");
+  
+  // 進度條
+  for (int i = 0; i <= 100; i += 10) {
+    display.fillRect(14, 20, i, 4, SSD1306_WHITE);
+    display.display();
+    delay(80);
+  }
+  delay(200);
+}
+
+// =====================================================================
+// 專業主畫面 - 儀表板風格
+// =====================================================================
+void showStatus() {
+  display.clearDisplay();
+  
+  // === 頂部資訊列 ===
+  display.setTextSize(1);
+  display.drawRect(0, 0, 42, 10, SSD1306_WHITE);
+  display.setCursor(2, 2);
+  if (ctrlSrc == 1) display.print("HALL");  
+  else if (ctrlSrc == 2) display.print("REMOTE");
+  else display.print("INIT");
+  
+  display.drawRect(86, 0, 42, 10, SSD1306_WHITE);
+  display.setCursor(88, 2);
+  int angle = (int)compAngleX;
+  if (angle >= 0) display.print(" ");
+  display.print(angle);
+  display.print("d");
+  
+  // === 中央大狀態 ===
+  display.setTextSize(2);
+  
+  if (showWheelAnim && (millis() - wheelAnimStartTime < 600)) {
+    byte frame = ((millis() - wheelAnimStartTime) / 100) % 3;
+    
+    if (wheelDown) {
+      display.setCursor(4, 14);
+      if (frame == 0) display.print("|");
+      else if (frame == 1) display.print("v");
+      else display.print("V");
+      
+      display.setCursor(20, 14);
+      display.print("DOWN");
+      
+      int arrowY = 16 + frame * 3;
+      display.fillTriangle(108, arrowY, 112, arrowY+4, 116, arrowY, SSD1306_WHITE);
+      display.fillTriangle(108, arrowY+5, 112, arrowY+9, 116, arrowY+5, SSD1306_WHITE);
+      
+    } else {
+      display.setCursor(4, 14);
+      if (frame == 0) display.print("|");
+      else if (frame == 1) display.print("^");
+      else display.print("^");
+      
+      display.setCursor(20, 14);
+      display.print("UP");
+      
+      int arrowY = 24 - frame * 3;
+      display.fillTriangle(108, arrowY+9, 112, arrowY+5, 116, arrowY+9, SSD1306_WHITE);
+      display.fillTriangle(108, arrowY+4, 112, arrowY, 116, arrowY+4, SSD1306_WHITE);
+    }
+    
+  } else {
+    showWheelAnim = false;
+    
+    if (wheelDown) {
+      display.setCursor(4, 14);
+      display.print("V DOWN");
+      
+      display.fillRect(0, 30, 128, 2, SSD1306_WHITE);
+      
+      display.fillTriangle(110, 16, 114, 20, 118, 16, SSD1306_WHITE);
+      display.fillTriangle(110, 22, 114, 26, 118, 22, SSD1306_WHITE);
+      
+    } else {
+      display.setCursor(16, 14);
+      display.print("^ UP");
+      
+      for (int x = 0; x < 128; x += 6) {
+        display.drawFastHLine(x, 12, 3, SSD1306_WHITE);
+      }
+      
+      display.fillTriangle(110, 26, 114, 22, 118, 26, SSD1306_WHITE);
+      display.fillTriangle(110, 20, 114, 16, 118, 20, SSD1306_WHITE);
+    }
+    
+    // 超音波警報圖標
+    if (distanceAlert) {
+        display.fillRect(0, 12, 5, 20, SSD1306_WHITE); 
+    }
+  }
+  
+  display.display();
+}
+
+// =====================================================================
+// 專業測試畫面
+// =====================================================================
+void testModules() {
+  display.clearDisplay();
+  display.fillRect(0, 0, 128, 32, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(2);
+  display.setCursor(8, 4);
+  display.print("SYSTEM");
+  display.setCursor(20, 18);
+  display.print("CHECK");
+  setRGBColor(COLOR_PASS); 
+  display.display();
+  display.setTextColor(SSD1306_WHITE);
+  delay(1000);
+  
+  String tests[] = {"OLED", "LCD", "MPU", "HALL", "RELAY", "BUZZ", "US"};
+  const int* testColors[] = {COLOR_PASS, COLOR_PASS, COLOR_MPU, COLOR_HALL, COLOR_RELAY, COLOR_BUZZER, COLOR_US};
+  
+  for (int i = 0; i < 7; i++) { 
+    display.clearDisplay();
+    
+    // 進度條
+    display.drawRect(10, 2, 108, 6, SSD1306_WHITE);
+    int progress = (i + 1) * 108 / 7;
+    display.fillRect(11, 3, progress, 4, SSD1306_WHITE);
+    
+    // 測試項目
+    display.setTextSize(2);
+    display.setCursor(20, 12);
+    display.print(tests[i]);
+    
+    setRGBColor(testColors[i]);
+    
+    // 計數
+    display.setTextSize(1);
+    display.setCursor(100, 24);
+    display.print(i+1);
+    display.print("/7");
+    
+    display.display();
+    
+    // 執行測試
+    if (i == 3) {  // Hall
+      int hall = digitalRead(HALL_SENSOR_PIN);
+      if (hall == LOW) {
+        display.setCursor(20, 24);
+        display.print("MAG!");
+        display.display();
+        setRGBColor(COLOR_HALL); 
+      }
+    } else if (i == 4) {  // Relay
+      digitalWrite(RELAY_PIN, HIGH);
+      setRGBColor(COLOR_RELAY); 
+      delay(200);
+      digitalWrite(RELAY_PIN, LOW);
+      setRGBColor(COLOR_PASS); 
+    } else if (i == 5) {  // Buzzer
+      digitalWrite(BUZZER_PIN, HIGH);
+      setRGBColor(COLOR_BUZZER); 
+      delay(150);
+      digitalWrite(BUZZER_PIN, LOW);
+      setRGBColor(COLOR_PASS); 
+    } else if (i == 6) { // 超音波 US
+      long testDist = readUltrasonic();
+      display.setCursor(20, 24);
+      display.print("D:");
+      display.print(testDist);
+      display.print("cm");
+      display.display();
+      setRGBColor(COLOR_US); 
+    }
+    
+    delay(600);
+    setRGBColor(COLOR_PASS); 
+  }
+  
+  // 完成畫面
+  display.clearDisplay();
+  display.fillRect(0, 0, 128, 32, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(3);
+  display.setCursor(16, 6);
+  display.print("DONE");
+  setRGBColor(COLOR_PASS); 
+  display.display();
+  display.setTextColor(SSD1306_WHITE);
+  
+  // 成功音效
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(80);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(80);
+  }
+  
+  delay(1500);
+}
+
+void updateLCD() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Ang:");
+  lcd.print(compAngleX, 1);
+  lcd.print("d");
+  
+  // 顯示超音波距離
+  lcd.setCursor(10, 0);
+  lcd.print(distance);
+  lcd.print("cm");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Whl:");
+  lcd.print(wheelDown ? "DOWN" : "UP  ");
+  
+  // 警報狀態提示
+  if (distanceAlert) {
+    lcd.setCursor(10, 1);
+    lcd.print("ALERT");
+  }
+}
+
+// =====================================================================
+// Setup
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Wire.begin();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(REMOTE_PIN, INPUT);
+  pinMode(HALL_SENSOR_PIN, INPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // 超音波腳位初始化
+  pinMode(US_TRIG_PIN, OUTPUT);
+  pinMode(US_ECHO_PIN, INPUT);
+
+  // 初始化 RGB LED 腳位
+  pinMode(RGB_R_PIN, OUTPUT);
+  pinMode(RGB_G_PIN, OUTPUT);
+  pinMode(RGB_B_PIN, OUTPUT);
+  setRGBColor(COLOR_OFF); 
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED Fail");
+    while (1);
+  }
+
+  // LCD
+  lcd.begin(16, 2);
+  lcd.setBacklight(1);
+  lcd.clear();
+  lcd.print("Initializing...");
+
+  // MPU
+  setupMPU();
+  calibrateIMU();
+
+  showStartup();
+  testModules();
+  
+  lcd.clear();
+  Serial.println("=== READY ===");
+}
+
+// =====================================================================
+// Loop
+// =====================================================================
+void loop() {
+  float ax, gx;
+  readIMU(ax, gx);
+
+  // 霍爾感測器
+  int hall = digitalRead(HALL_SENSOR_PIN);
+  if (hall != lastHallState) {
+    wheelDown = (hall == LOW);
+    ctrlSrc = 1;
+    digitalWrite(RELAY_PIN, wheelDown ? HIGH : LOW);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(wheelDown ? 100 : 50);
+    digitalWrite(BUZZER_PIN, LOW);
+    showWheelAnim = true;
+    wheelAnimStartTime = millis();
+    lastHallState = hall;
+  }
+
+  // 遙控器
+  int rem = digitalRead(REMOTE_PIN);
+  if (rem == HIGH && lastRemoteRead == LOW) { 
+    wheelDown = !wheelDown;
+    ctrlSrc = 2;
+    digitalWrite(RELAY_PIN, wheelDown ? HIGH : LOW);
+    showWheelAnim = true;
+    wheelAnimStartTime = millis();
+  }
+  lastRemoteRead = rem; 
+
+  // ---------- 超音波讀取與警報判斷 (每 100ms 讀取一次) ----------
+  unsigned long now = millis();
+  
+  if (now - lastUltrasonicRead > 100) {
+    distance = readUltrasonic(); 
+    lastUltrasonicRead = now;
+    
+    // 設定警報範圍：距離小於 100cm 時觸發
+    if (distance < 100 && distance > 0) {
+      distanceAlert = true;
+    } else {
+      distanceAlert = false;
+    }
+  }
+
+  // [修改] 替換 Vector 的靜態變數
+  static const int* colorsToCarouselArray[8]; // 固定大小的顏色指標陣列
+  static int currentCarouselCount = 0;        // 當前陣列中有效的顏色數量
+  static int carouselIndex = 0;               // 輪播索引
+  static unsigned long lastWheelColorTime = 0;
+  
+  // ---------- RGB LED 顏色輪播邏輯 (核心 - 使用陣列) ----------
+  
+  // 1. 每隔一段時間重新檢查狀態並更新 LED
+  if (millis() - lastWheelColorTime >= CAROUSEL_INTERVAL) {
+    lastWheelColorTime = millis();
+    
+    // 將計數器歸零 (清空舊列表)
+    currentCarouselCount = 0;
+    
+    // 檢查所有模組的狀態 (非 PASS 狀態才加入輪播)
+    
+    // 超音波警報 (COLOR_US)
+    if (distanceAlert) {
+      colorsToCarouselArray[currentCarouselCount++] = COLOR_US;
+    }
+    
+    // MPU: 角度過大 (COLOR_MPU)
+    // [修改] 使用 fabs() 替換 std::abs()
+    if (fabs(compAngleX) > 30.0f) { 
+        colorsToCarouselArray[currentCarouselCount++] = COLOR_MPU;
+    }
+    // 繼電器: 處於啟動狀態 (COLOR_RELAY)
+    if (digitalRead(RELAY_PIN) == HIGH) { 
+        colorsToCarouselArray[currentCarouselCount++] = COLOR_RELAY;
+    }
+    // 霍爾: 車輪放下狀態 (COLOR_HALL)
+    if (wheelDown) { 
+        colorsToCarouselArray[currentCarouselCount++] = COLOR_HALL;
+    }
+    // 紅外線: 當前遙控器訊號為 HIGH (COLOR_REMOTE)
+    if (rem == HIGH) { 
+        colorsToCarouselArray[currentCarouselCount++] = COLOR_REMOTE;
+    }
+
+
+    if (currentCarouselCount == 0) {
+      // 2a. 如果所有模組 PASS -> 顯示綠色
+      setRGBColor(COLOR_PASS);
+      carouselIndex = 0;
+    } else {
+      // 2b. 執行輪播
+      carouselIndex = (carouselIndex + 1) % currentCarouselCount;
+      setRGBColor(colorsToCarouselArray[carouselIndex]);
+    }
+  }
+
+  // ---------- 顯示 (降低更新頻率) ----------
+  if (millis() - lastDisplayTime > 50) {
+    showStatus();
+    lastDisplayTime = millis();
+  }
+  
+  if (millis() - lastPrintTime > 500) {
+    updateLCD();
+    lastPrintTime = millis();
+  }
+
+  delay(20);
+}
